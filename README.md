@@ -5,7 +5,7 @@ Shared tools for projects.
 | Tool | What it does | Why |
 |---|---|---|
 | `shell/newproject.zsh` | `newproject <name>`: create a new project | Easy way to set up a new project on a whim when inspiration strikes |
-| `bin/git-preview` | `git preview`: publish uncommitted work to QA (mostly from `dev`) | Check the frontend on a phone before committing |
+| `bin/git-preview` | `git preview`: publish uncommitted work to QA (mostly from `dev`) | Check if the frontend works before committing |
 | `bin/git-ship` | `git ship`: `git push`, then publish (sync) the frontend | Allows serving both PROD and QA versions of website frontend on GH Pages|
 
 
@@ -39,7 +39,7 @@ Push the current branch, then publish the frontend to GitHub Pages.
 git preview
 ```
 
-Publishes your **working files** to `https://kevingrazel.com/<repo>/qa/`, including uncommitted edits and new files (anything `.gitignore` excludes is skipped). It works on any branch **except `main`**, and it doesn't push or commit anything in your repo. Edit, preview, check on your phone, repeat; commit when you're happy.
+Publishes your **working files** to `https://<mydomain>/<repo>/qa/`, including uncommitted edits and new files (anything `.gitignore` excludes is skipped). It works on any branch **except `main`**, and it doesn't push or commit anything in your repo. Edit, preview, check on your phone, repeat; commit when you're happy.
 
 `/qa/` shows whichever ran last: `git ship` on `test`, or `git preview`.
 
