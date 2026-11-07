@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# git-ship: push the current branch, then publish its frontend to GitHub Pages.
+# Also `git preview` (bin/git-preview is a symlink to this file).
+#
+#   git ship         push the current branch; on main or test, also publish
+#   git preview      publish your working files (uncommitted included) to qa/,
+#                    without pushing; any branch except main (mostly for dev)
+#   git ship init    create the gh-pages branch and turn on Pages now
+#                    (optional: the first publish does it automatically)
+#   git ship help    show this help
+#
+# A repo opts in with a .ship file at its root (committed; newproject adds it):
+#   FRONTEND_DIR=website
+# Without .ship, or until that folder exists, `git ship` is just a push.
+#
+# Publishing copies FRONTEND_DIR, as of the commit just pushed, into the repo's
+# gh-pages branch, which GitHub Pages serves:
+#   main -> gh-pages root   https://<domain>/<repo>/
+#   test -> gh-pages qa/    https://<domain>/<repo>/qa/
+# git ship publishes committed code only; git preview publishes working files.
+# Nobody edits gh-pages by hand; every publish starts fresh from GitHub's
+# copy, so re-running is always safe.
+set -euo pipefail
+
+PAGES_BRANCH="gh-pages"
+CONFIG=".ship"
+REMOTE="origin"
+# This file's full path, captured before the cd below (help reads it)
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+die()  { echo "git-ship: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+usage() { sed -n '2,22p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
+cd "$ROOT"
+
+# Origin's owner/name when it's a GitHub repo, else empty
+github_repo() {
+    git remote get-url "$REMOTE" 2>/dev/null \
+        | sed -nE 's#^(git@github\.com:|https://github\.com/|ssh://git@github\.com/)([^/]+/[^/]+)$#\2#p' \
+        | sed 's/\.git$//'
+}
+
+# Field <jq> of GitHub repo <owner/name>'s Pages settings; empty if Pages is off.
+# On an error, gh prints the error reply to stdout, so only trust its output on success.
+pages_get() {
+    local out
+    out=$(gh api "repos/$1/pages" -q "$2" 2>/dev/null) && printf '%s' "$out"
+    return 0
+}
+
+# FRONTEND_DIR from .ship text on stdin. Parsed, never sourced, so the file can't run code.
+parse_config() {
+    local dir
+    dir=$(sed -n 's/^FRONTEND_DIR=//p' | tail -1 | tr -d '\r"'"'")
+    dir=${dir%/}
+    [ -n "$dir" ] || die "$CONFIG has no FRONTEND_DIR= line"
+    echo "$dir"
+}
+
+# FRONTEND_DIR from .ship as committed in <commit>; empty if no .ship
+frontend_dir_at() {
+    git cat-file -e "$1:$CONFIG" 2>/dev/null || return 0
+    git show "$1:$CONFIG" | parse_config
+}
+
+# Fill <out> with <dir> as committed in <sha>
+fill_from_commit() {
+    git archive "$2" "$3" | tar -x -C "$1"
+}
+
+# Fill <out> with <dir> as it is on disk: tracked and new files, skipping
+# anything .gitignore excludes (and tracked files you've deleted)
+fill_from_working() {
+    git ls-files -z --cached --others --exclude-standard -- "$2" \
+        | while IFS= read -r -d '' f; do [ -f "$f" ] && printf '%s\0' "$f"; done \
+        | tar --null -T - -cf - | tar -xf - -C "$1"
+}
+
+placeholder_page() {
+    cat <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$1</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         font-family: system-ui, -apple-system, sans-serif; background: Canvas; color: CanvasText; }
+  main { text-align: center; padding: 1rem; }
+  h1 { font-size: 2rem; margin: 0 0 0.5rem; }
+  p { margin: 0; opacity: 0.6; }
+</style>
+</head>
+<body><main><p>$1 Coming soon</p></main></body>
+</html>
+EOF
+}
+
+cmd_init() {
+    if git ls-remote --exit-code --heads "$REMOTE" "$PAGES_BRANCH" >/dev/null 2>&1; then
+        info "'$PAGES_BRANCH' branch already exists on $REMOTE"
+    else
+        info "Creating '$PAGES_BRANCH' branch on $REMOTE"
+        # Built directly as a parentless commit; the working folder is never touched.
+        # .nojekyll: serve files as-is (no Jekyll build).
+        # index.html: "coming soon" page until the first publish from main replaces it.
+        local name nojekyll page tree commit
+        name=$(basename "$ROOT")
+        nojekyll=$(git hash-object -w --stdin </dev/null)
+        page=$(placeholder_page "$name" | git hash-object -w --stdin)
+        tree=$(printf '100644 blob %s\t.nojekyll\n100644 blob %s\tindex.html\n' "$nojekyll" "$page" | git mktree)
+        commit=$(git commit-tree "$tree" -m "Initialize $PAGES_BRANCH branch (git ship)")
+        local out
+        out=$(git push --no-verify "$REMOTE" "$commit:refs/heads/$PAGES_BRANCH" 2>&1) \
+            || { echo "$out" >&2; die "couldn't push the $PAGES_BRANCH branch"; }
+    fi
+
+    local repo source i
+    repo=$(github_repo)
+    if [ -z "$repo" ]; then
+        info "Remote isn't on GitHub; skipping Pages setup"
+        return
+    fi
+    command -v gh >/dev/null || die "gh not installed. Turn on Pages by hand: GitHub repo → Settings → Pages → Deploy from a branch → '$PAGES_BRANCH', / (root)"
+
+    # GitHub turns Pages on by itself when a branch named gh-pages is pushed,
+    # so give that a few seconds before asking for it ourselves
+    pages_source() { pages_get "$repo" .source.branch; }
+    for i in 1 2 3 4 5; do
+        source=$(pages_source)
+        [ -n "$source" ] && break
+        sleep 2
+    done
+    if [ -z "$source" ]; then
+        info "Turning on GitHub Pages for $repo"
+        gh api -X POST "repos/$repo/pages" \
+            -f "source[branch]=$PAGES_BRANCH" -f "source[path]=/" >/dev/null 2>&1 || true
+        source=$(pages_source)
+    fi
+    [ -n "$source" ] || die "couldn't turn on Pages. Do it by hand: GitHub repo → Settings → Pages → Deploy from a branch → '$PAGES_BRANCH', / (root)"
+    [ "$source" = "$PAGES_BRANCH" ] \
+        || echo "git-ship: note: Pages serves '$source', not '$PAGES_BRANCH'. Change it in Settings → Pages" >&2
+
+    # Redirect http:// to https://. Can be refused for a few seconds right after
+    # Pages is turned on, so retry briefly.
+    for i in 1 2 3 4 5; do
+        [ "$(pages_get "$repo" .https_enforced)" = "true" ] && break
+        gh api -X PUT "repos/$repo/pages" -F https_enforced=true >/dev/null 2>&1 || sleep 3
+    done
+    [ "$(pages_get "$repo" .https_enforced)" = "true" ] \
+        || echo "git-ship: note: couldn't enforce HTTPS yet; turn it on later in Settings → Pages" >&2
+    info "View project website at: $(pages_get "$repo" .html_url | sed 's#^http://#https://#')"
+}
+
+# publish <target> <label> <commit message> <dir> <fill function> <fill args...>
+publish() {
+    local target=$1 label=$2 msg=$3 dir=$4 fill=$5 tmp site src
+    shift 5
+    if ! git fetch -q "$REMOTE" "$PAGES_BRANCH" 2>/dev/null; then
+        info "First publish for this repo; setting up GitHub Pages"
+        cmd_init
+        git fetch -q "$REMOTE" "$PAGES_BRANCH"
+    fi
+
+    tmp=$(mktemp -d)
+    site="$tmp/site"; src="$tmp/src"
+    # Remove the temporary checkout on any exit
+    trap 'git -C "'"$ROOT"'" worktree remove --force "'"$site"'" 2>/dev/null; rm -rf "'"$tmp"'"' EXIT
+
+    # Second checkout of the Pages branch in a temp folder, starting from
+    # GitHub's copy (detached, so no local gh-pages branch is needed)
+    git worktree add -q --detach "$site" "$REMOTE/$PAGES_BRANCH"
+
+    mkdir -p "$src"
+    "$fill" "$src" "$@"
+
+    if [ "$target" = "." ]; then
+        # Root holds prod; leave QA, .nojekyll and the worktree's .git file alone
+        rsync -a --checksum --delete --exclude=/qa/ --exclude=/.nojekyll --exclude=/.git \
+            "$src/$dir/" "$site/"
+    else
+        mkdir -p "$site/$target"
+        rsync -a --checksum --delete "$src/$dir/" "$site/$target/"
+    fi
+
+    git -C "$site" add -A
+    if git -C "$site" diff --cached --quiet; then
+        info "$label frontend already up to date"
+        return
+    fi
+    git -C "$site" commit -q --no-verify -m "$msg"
+    info "Publishing: $msg"
+    git -C "$site" push -q --no-verify "$REMOTE" "HEAD:refs/heads/$PAGES_BRANCH" \
+        || die "$PAGES_BRANCH push failed; nothing else changed, so just run git ship again"
+
+    local repo url=""
+    repo=$(github_repo)
+    [ -n "$repo" ] && url=$(pages_get "$repo" .html_url | sed 's#^http://#https://#')
+    [ "$target" = "." ] || url="${url:+${url%/}/$target/}"
+    info "Published.${url:+ $url} (GitHub Pages usually updates within a minute)"
+}
+
+cmd_ship() {
+    local branch sha dir target label
+    branch=$(git symbolic-ref --short -q HEAD) || die "not on a branch (detached HEAD)"
+
+    info "Pushing $branch"
+    git push "$REMOTE" "$branch"   # stop here if the push fails: nothing gets published
+
+    case "$branch" in
+      main) target="."  ; label="prod" ;;
+      test) target="qa" ; label="qa"   ;;
+      *)    return ;;               # other branches just push
+    esac
+
+    sha=$(git rev-parse HEAD)
+    dir=$(frontend_dir_at "$sha")
+    [ -n "$dir" ] || return 0      # no .ship: no frontend to publish
+    if ! git cat-file -e "$sha:$dir" 2>/dev/null; then
+        info "No $dir/ yet; nothing to publish"
+        return 0
+    fi
+
+    if [ -n "$(git status --porcelain -- "$dir")" ]; then
+        echo "git-ship: note: uncommitted changes in $dir are not published" >&2
+    fi
+    publish "$target" "$label" "$label from $branch@${sha:0:7}" "$dir" fill_from_commit "$sha" "$dir"
+}
+
+cmd_preview() {
+    local branch sha dir msg
+    branch=$(git symbolic-ref --short -q HEAD) || die "not on a branch (detached HEAD)"
+    # main only ever publishes committed code, to prod, via plain `git ship`
+    [ "$branch" != "main" ] || die "preview is disabled on main. Switch to dev or test (git switch dev), or use 'git ship' to publish prod"
+
+    [ -f "$CONFIG" ] || die "no $CONFIG in this repo, so there's no frontend to preview"
+    dir=$(parse_config < "$CONFIG")
+    [ -d "$dir" ] || die "no $dir/ folder yet; nothing to preview"
+
+    sha=$(git rev-parse --short HEAD)
+    msg="qa preview from $branch@$sha"
+    [ -z "$(git status --porcelain -- "$dir")" ] || msg="$msg + uncommitted changes"
+    publish "qa" "qa" "$msg" "$dir" fill_from_working "$dir"
+}
+
+# bin/git-preview is a symlink to this file; the name it was run as picks the command
+if [ "$(basename "$0")" = "git-preview" ]; then
+    case "${1:-}" in
+      "")          cmd_preview ;;
+      help|-h)     usage ;;
+      *)           usage >&2; exit 1 ;;
+    esac
+else
+    case "${1:-}" in
+      "")          cmd_ship ;;
+      init)        cmd_init ;;
+      help|-h)     usage ;;
+      *)           usage >&2; exit 1 ;;
+    esac
+fi
